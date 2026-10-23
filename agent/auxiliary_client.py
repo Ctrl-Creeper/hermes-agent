@@ -5834,7 +5834,7 @@ def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[
     with _client_cache_lock:
         old_entry = _client_cache.get(cache_key)
         if old_entry is not None and old_entry[0] is not client:
-            _close_cached_client(old_entry[0])
+            _close_cached_client(old_entry[0], owner_loop=old_entry[2])
         _client_cache[cache_key] = (client, default_model, bound_loop)
 
 
@@ -5892,14 +5892,10 @@ def neuter_async_httpx_del() -> None:
         pass  # Graceful degradation if the SDK changes its internals
 
 
-def _force_close_async_httpx(client: Any) -> None:
-    """Mark the httpx AsyncClient inside an AsyncOpenAI client as closed so ``__del__`` won't
-    schedule ``aclose()`` on a dead loop. Skips the full async close — the OS drops connections."""
-    with contextlib.suppress(Exception):
-        from httpx._client import ClientState
-        inner = getattr(client, "_client", None)
-        if inner is not None and not getattr(inner, "is_closed", True):
-            inner._state = ClientState.CLOSED
+def _force_close_async_httpx(client: Any, owner_loop: Any = None) -> None:
+    """Release orphaned sockets without racing a live loop's TLS I/O."""
+    from agent.auxiliary_client_cleanup import close_orphaned_httpx
+    close_orphaned_httpx(client, owner_loop)
 
 
 def _schedule_async_close(close_result: Any, client: Any) -> None:
@@ -5909,8 +5905,6 @@ def _schedule_async_close(close_result: Any, client: Any) -> None:
             await close_result
         except Exception:
             pass
-        finally:
-            _force_close_async_httpx(client)
     runner = _await_close()
     try:
         import asyncio as _aio
@@ -5930,33 +5924,31 @@ def _schedule_async_close(close_result: Any, client: Any) -> None:
         if runner is not None:
             with contextlib.suppress(Exception):
                 runner.close()
-        _force_close_async_httpx(client)
 
 
-def _close_cached_client(client: Any, *, close_async: bool = False) -> None:
+def _close_cached_client(client: Any, *, close_async: bool = False, owner_loop: Any = None) -> None:
     """Close one cached client, awaiting async transports only when safe."""
     if client is None:
         return
+    if owner_loop is not None and owner_loop.is_closed():
+        _force_close_async_httpx(client, owner_loop)
+        return
     close_fn = getattr(client, "close", None)
     if not callable(close_fn):
-        _force_close_async_httpx(client)
         return
     try:
         close_result = close_fn()
     except Exception:
-        _force_close_async_httpx(client)
         return
     if inspect.isawaitable(close_result):
         if close_async:
             _schedule_async_close(close_result, client)
         else:
-            # Never await a client owned by another live loop; close the coroutine (no
-            # unawaited warning) and neuter the transport.
+            # A foreign live loop may still be using this client. Discard only
+            # the close coroutine; never invalidate its transport or TLS FDs.
             with contextlib.suppress(Exception):
                 close_result.close()
-            _force_close_async_httpx(client)
         return
-    _force_close_async_httpx(client)
 
 
 def shutdown_cached_clients() -> None:
@@ -5977,18 +5969,18 @@ def shutdown_cached_clients() -> None:
         # A live foreign loop owns its transport — neuter only and let it finish teardown.
         # Closed loops and the current loop are safe to drain here.
         close_async = owner_loop is not None and (owner_loop.is_closed() or owner_loop is running_loop)
-        _close_cached_client(client, close_async=close_async)
+        _close_cached_client(client, close_async=close_async, owner_loop=owner_loop)
 
 
 def cleanup_stale_async_clients() -> None:
     """Force-close cached async clients whose loop is closed; call after each agent turn
     (defense-in-depth behind ``neuter_async_httpx_del``)."""
     with _client_cache_lock:
-        stale = [(key, entry[0]) for key, entry in _client_cache.items() if entry[2] is not None and entry[2].is_closed()]
-        for key, _client in stale:
+        stale = [(key, entry) for key, entry in _client_cache.items() if entry[2] is not None and entry[2].is_closed()]
+        for key, _entry in stale:
             del _client_cache[key]
-    for _key, client in stale:
-        _close_cached_client(client, close_async=True)
+    for _key, entry in stale:
+        _close_cached_client(entry[0], owner_loop=entry[2])
 
 
 def _compat_model(client: Any, model: Optional[str], cached_default: Optional[str]) -> Optional[str]:
@@ -6040,9 +6032,8 @@ def _get_cached_client(
             )
             if loop_ok:
                 return cached_client, _compat_model(cached_client, model, cached_default)
-            # Stale async entry — evict. Only a closed owner loop may be awaited here; a live
-            # foreign loop stays force-neutered.
-            _close_cached_client(cached_client, close_async=cached_loop is not None and cached_loop.is_closed())
+            # Closed owners release orphaned FDs; foreign live owners remain usable.
+            _close_cached_client(cached_client, owner_loop=cached_loop)
             del _client_cache[cache_key]
     # Build outside the lock. For pool-backed providers derive the key from the pool entry:
     # resolve_api_key_provider_credentials prefers env vars, which would bypass pool rotation

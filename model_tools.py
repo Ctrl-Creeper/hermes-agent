@@ -121,7 +121,11 @@ def _run_async(coro):
                         worker_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
                 except Exception:
                     pass
-                worker_loop.close()
+                try:
+                    from agent.auxiliary_client_cleanup import close_async_clients_for_loop
+                    worker_loop.run_until_complete(close_async_clients_for_loop())
+                finally:
+                    worker_loop.close()
 
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Carry profile + approval/sudo context so get_hermes_home() resolves correctly.
